@@ -35,6 +35,7 @@ using Microsoft.CodeAnalysis.Debugging;
 using Microsoft.VisualStudio.Shell.Interop;
 using System.Reflection.PortableExecutable;
 using Microsoft.VisualStudio.LanguageServices.EditAndContinue;
+using Microsoft.CodeAnalysis.Shared.Extensions;
 using Microsoft.CodeAnalysis.PooledObjects;
 
 namespace Microsoft.VisualStudio.LanguageServices.Implementation.EditAndContinue
@@ -530,6 +531,141 @@ namespace Microsoft.VisualStudio.LanguageServices.Implementation.EditAndContinue
             //        debugNotify.NotifyEncUpdateCurrentStatement();
             //    });
             //}
+        }
+
+        private struct VsActiveStatement
+        {
+            public readonly DocumentId DocumentId;
+            public readonly uint StatementId;
+            public readonly ActiveStatementSpan Span;
+            public readonly VsENCRebuildableProjectImpl Owner;
+
+            public VsActiveStatement(VsENCRebuildableProjectImpl owner, uint statementId, DocumentId documentId, ActiveStatementSpan span)
+            {
+                this.Owner = owner;
+                this.StatementId = statementId;
+                this.DocumentId = documentId;
+                this.Span = span;
+            }
+        }
+
+        private struct VsExceptionRegion
+        {
+            public readonly uint ActiveStatementId;
+            public readonly int Ordinal;
+            public readonly uint MethodToken;
+            public readonly LinePositionSpan Span;
+
+            public VsExceptionRegion(uint activeStatementId, int ordinal, uint methodToken, LinePositionSpan span)
+            {
+                this.ActiveStatementId = activeStatementId;
+                this.Span = span;
+                this.MethodToken = methodToken;
+                this.Ordinal = ordinal;
+            }
+        }
+
+        // See InternalApis\vsl\inc\encbuild.idl
+        private const int TEXT_POSITION_ACTIVE_STATEMENT = 1;
+
+        private void AddActiveStatements(Solution solution, ShellInterop.ENC_ACTIVE_STATEMENT[] vsActiveStatements)
+        {
+            Debug.Assert(_activeMethods.Count == 0);
+            Debug.Assert(_exceptionRegions.Count == 0);
+
+            foreach (var vsActiveStatement in vsActiveStatements)
+            {
+                log.DebugWrite("+AS[{0}]: {1} {2} {3} {4} '{5}'",
+                    unchecked((int)vsActiveStatement.id),
+                    vsActiveStatement.tsPosition.iStartLine,
+                    vsActiveStatement.tsPosition.iStartIndex,
+                    vsActiveStatement.tsPosition.iEndLine,
+                    vsActiveStatement.tsPosition.iEndIndex,
+                    vsActiveStatement.filename);
+
+                // TODO (tomat):
+                // Active statement is in user hidden code. The only information that we have from the debugger
+                // is the method token. We don't need to track the statement (it's not in user code anyways),
+                // but we should probably track the list of such methods in order to preserve their local variables.
+                // Not sure what's exactly the scenario here, perhaps modifying async method/iterator? 
+                // Dev12 just ignores these.
+                if (vsActiveStatement.posType != TEXT_POSITION_ACTIVE_STATEMENT)
+                {
+                    continue;
+                }
+
+                var flags = (ActiveStatementFlags)vsActiveStatement.ASINFO;
+
+                // Finds a document id in the solution with the specified file path.
+                DocumentId documentId = solution.GetDocumentIdsWithFilePath(vsActiveStatement.filename)
+                    .Where(dId => dId.ProjectId == _vsProject.Id).SingleOrDefault();
+
+                if (documentId != null)
+                {
+                    var document = solution.GetDocument(documentId);
+                    Debug.Assert(document != null);
+
+                    SourceText source = document.GetTextAsync(default).Result;
+                    LinePositionSpan lineSpan = vsActiveStatement.tsPosition.ToLinePositionSpan();
+
+                    // If the PDB is out of sync with the source we might get bad spans.
+                    var sourceLines = source.Lines;
+                    if (lineSpan.End.Line >= sourceLines.Count || sourceLines.GetPosition(lineSpan.End) > sourceLines[sourceLines.Count - 1].EndIncludingLineBreak)
+                    {
+                        log.Write("AS out of bounds (line count is {0})", source.Lines.Count);
+                        continue;
+                    }
+
+                    SyntaxNode syntaxRoot = document.GetSyntaxRootAsync(default).Result;
+
+                    var analyzer = document.GetLanguageService<IEditAndContinueAnalyzer>();
+
+                    s_pendingActiveStatements.Add(new VsActiveStatement(
+                        this,
+                        vsActiveStatement.id,
+                        document.Id,
+                        new ActiveStatementSpan(flags, lineSpan)));
+
+                    bool isLeaf = (flags & ActiveStatementFlags.LeafFrame) != 0;
+                    var ehRegions = analyzer.GetExceptionRegions(source, syntaxRoot, lineSpan, isLeaf);
+
+                    for (int i = 0; i < ehRegions.Length; i++)
+                    {
+                        _exceptionRegions.Add(new VsExceptionRegion(
+                            vsActiveStatement.id,
+                            i,
+                            vsActiveStatement.methodToken,
+                            ehRegions[i]));
+                    }
+                }
+
+                _activeMethods.Add(vsActiveStatement.methodToken);
+            }
+        }
+
+        private static void GroupActiveStatements(
+            IEnumerable<VsActiveStatement> activeStatements,
+            Dictionary<DocumentId, ImmutableArray<ActiveStatementSpan>> byDocument)
+        {
+            var spans = new List<ActiveStatementSpan>();
+
+            foreach (var grouping in activeStatements.GroupBy(s => s.DocumentId))
+            {
+                var documentId = grouping.Key;
+
+                foreach (var activeStatement in grouping.OrderBy(s => s.Span.Span.Start))
+                {
+                    int ordinal = spans.Count;
+
+                    // register vsid with the project that owns the active statement:
+                    activeStatement.Owner._activeStatementIds.Add(activeStatement.StatementId, new ActiveStatementId(documentId, ordinal));
+
+                    spans.Add(activeStatement.Span);
+                }
+
+                byDocument.Add(documentId, spans.AsImmutable());
+                spans.Clear();
+            }
         }
 
         // obsolete

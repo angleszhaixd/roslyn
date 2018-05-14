@@ -15,6 +15,7 @@ using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.ErrorReporting;
 using Microsoft.CodeAnalysis.PooledObjects;
 using Microsoft.CodeAnalysis.Text;
+using Microsoft.CodeAnalysis.Shared.Extensions;
 using Roslyn.Utilities;
 
 namespace Microsoft.CodeAnalysis.EditAndContinue
@@ -339,7 +340,7 @@ namespace Microsoft.CodeAnalysis.EditAndContinue
                 return analysis.Results;
             }
 
-            var analyzer = document.Project.LanguageServices.GetRequiredService<IEditAndContinueAnalyzer>();
+            var analyzer = document.GetLanguageService<IEditAndContinueAnalyzer>();
 
             var lazyResults = new AsyncLazy<DocumentAnalysisResults>(
                 asynchronousComputeFunction: async cancellationToken =>
